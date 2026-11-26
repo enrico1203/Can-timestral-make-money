@@ -1,0 +1,112 @@
+name: tradebot
+
+x-core-env: &core-env
+  DATABASE_URL: postgresql://bot:${DB_PASSWORD}@db:5432/trading
+  TRADING_MODE: paper            # the only accepted value: the bot refuses to start otherwise
+  FORECASTER_URL: http://forecaster:8000
+  EXCHANGE: binance
+  SYMBOLS: ${SYMBOLS:-BTC/USDT,ETH/USDT,SOL/USDT}
+  TIMEFRAME: ${TIMEFRAME:-1h}
+  MODEL_ID: ${MODEL_ID:-mistralai/Timestral-28M}
+  BACKFILL_START: "2022-01-01"
+  HOLDOUT_START: "2026-10-16"
+  TZ: UTC
+
+x-core: &core
+  build: ./services/core
+  image: tradebot-core
+  environment: *core-env
+  restart: unless-stopped
+  depends_on:
+    db: { condition: service_healthy }
+  logging:
+    driver: json-file
+    options: { max-size: "10m", max-file: "3" }
+
+services:
+  db:
+    image: timescale/timescaledb:2.17.2-pg16
+    environment:
+      POSTGRES_USER: bot
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: trading
+    volumes: [dbdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bot -d trading"]
+      interval: 5s
+      retries: 30
+    restart: unless-stopped
+
+  forecaster:
+    build: ./services/forecaster
+    image: tradebot-forecaster
+    environment:
+      MODEL_ID: ${MODEL_ID:-mistralai/Timestral-28M}
+      ALLOWED_MODELS: mistralai/Timestral-5M,mistralai/Timestral-28M,mistralai/Timestral-123M,mistralai/Timestral-209M
+      HF_HOME: /hf
+      TORCH_NUM_THREADS: ${TORCH_NUM_THREADS:-4}
+    volumes: [hfcache:/hf]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 180s
+    deploy:
+      resources:
+        limits: { memory: 6g }
+    restart: unless-stopped
+
+  collector:
+    <<: *core
+    command: ["python", "-m", "tradebot.collector"]
+
+  trader:
+    <<: *core
+    command: ["python", "-m", "tradebot.trader"]
+    depends_on:
+      db: { condition: service_healthy }
+      forecaster: { condition: service_healthy }
+
+  worker:
+    <<: *core
+    command: ["python", "-m", "tradebot.worker"]
+    depends_on:
+      db: { condition: service_healthy }
+      forecaster: { condition: service_healthy }
+
+  api:
+    <<: *core
+    command: ["uvicorn", "tradebot.api:app", "--host", "0.0.0.0", "--port", "8000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 10s
+      retries: 10
+
+  webui:
+    build: ./services/webui
+    image: tradebot-webui
+    environment:
+      UI_USER: ${UI_USER}
+      UI_PASSWORD: ${UI_PASSWORD}
+    ports:
+      - "127.0.0.1:${WEBUI_PORT:-8230}:80"
+      # optional extra bind (e.g. Tailscale IP); defaults to localhost again
+      - "${WEBUI_BIND_EXTRA:-127.0.0.2}:${WEBUI_PORT:-8230}:80"
+    depends_on: [api]
+    restart: unless-stopped
+
+  # One-shot CLI for research: docker compose --profile cli run --rm backtester python -m tradebot.backtest.run suite ...
+  backtester:
+    <<: *core
+    profiles: ["cli"]
+    restart: "no"
+    command: ["python", "-m", "tradebot.backtest.run", "--help"]
+    depends_on:
+      db: { condition: service_healthy }
+
+volumes:
+  dbdata:
+  hfcache:
+    external: true
+    name: tradebot_hfcache
